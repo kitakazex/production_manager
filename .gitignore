@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local database and backups
+data/*.db
+data/*.db-*
+data/backup/
+*.sqlite
+*.sqlite3
+
+# Personal settings
+data/settings.json
+.env
+.env.*
+
+# Generated files
+export/
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
