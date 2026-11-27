@@ -19,6 +19,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 import pandas as pd
+from manufacturing_flow import create_tables
 from PySide6.QtCore import QDate, Qt, Signal, QSettings
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
@@ -585,6 +586,8 @@ class Database:
         self.conn.commit()
         self.migrate_phase1_schema()
         self.ensure_order_delivery_user_column()
+        # 工程実績・納品後の管理は手配ステータスと独立した追加表に保存する。
+        create_tables(self.conn)
 
     def ensure_order_delivery_user_column(self) -> None:
         """既存DBへ納入先ユーザー列を安全に追加する。"""
