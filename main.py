@@ -2002,6 +2002,7 @@ class DashboardWidget(QWidget):
     """Phase 5: 手配実績を基に進捗・遅延原因・今日の要対応を見える化する。"""
 
     procurement_requested = Signal(int)  # 要対応行から進捗ツリーへ移動するための手配工程ID
+    bottleneck_requested = Signal(str)  # 加工内容別の要対応工程一覧を開く
 
     STATUS_PROGRESS = {
         "未手配": 0,
@@ -2078,6 +2079,7 @@ class DashboardWidget(QWidget):
         self.bottleneck_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.bottleneck_table.setAlternatingRowColors(True)
         self.bottleneck_table.setMinimumHeight(95)
+        self.bottleneck_table.cellDoubleClicked.connect(self.open_bottleneck_details)
 
         self.dashboard_horizontal_splitter.addWidget(self.series_table)
         self.dashboard_horizontal_splitter.addWidget(self.bottleneck_table)
@@ -2154,6 +2156,12 @@ class DashboardWidget(QWidget):
         procurement_id = item.data(Qt.UserRole)
         if procurement_id is not None:
             self.procurement_requested.emit(int(procurement_id))
+
+    def open_bottleneck_details(self, row_index: int, _column: int) -> None:
+        """ソート後も表示行に保持した加工内容で絞り込みを要求する。"""
+        item = self.bottleneck_table.item(row_index, 0)
+        if item is not None and item.data(Qt.UserRole) is not None:
+            self.bottleneck_requested.emit(str(item.data(Qt.UserRole)))
 
     @classmethod
     def procurement_progress(cls, status):
@@ -2305,6 +2313,7 @@ class DashboardWidget(QWidget):
 
         # 遅延原因上位。
         sorted_bottlenecks = sorted(bottlenecks.items(), key=lambda x: (-x[1]["total"], x[0]))[:10]
+        self.bottleneck_table.setSortingEnabled(False)
         self.bottleneck_table.setRowCount(len(sorted_bottlenecks))
         for i, (detail, b) in enumerate(sorted_bottlenecks):
             main_vendor = max(b["vendors"], key=b["vendors"].get) if b["vendors"] else "－"
@@ -2313,7 +2322,11 @@ class DashboardWidget(QWidget):
                 item = QTableWidgetItem(str(value))
                 if c in (1, 2, 3) and int(value) > 0:
                     item.setForeground(QColor("red" if c == 3 else "darkorange"))
+                if c == 0:
+                    item.setData(Qt.UserRole, detail)
                 self.bottleneck_table.setItem(i, c, item)
+
+        self.bottleneck_table.setSortingEnabled(True)
 
         # 生産計画別進捗。
         self.order_table.setSortingEnabled(False)
@@ -2365,6 +2378,87 @@ class DashboardWidget(QWidget):
             f"全体手配進捗 {average}% ／ 要対応工程 {len(action_rows)}件 ／ "
             f"表示中の生産計画 {len(filtered_orders)}件"
         )
+
+
+class BottleneckDetailsDialog(QDialog):
+    """加工内容別の集計を、その根拠となる全要対応手配工程へ展開する。"""
+
+    def __init__(self, db: Database, processing_details: str, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.processing_details = processing_details
+        self.selected_procurement_id = None
+        self.setWindowTitle(f"ボトルネック詳細：{processing_details}")
+        self.resize(1160, 610)
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            f"加工内容：{processing_details}　｜　要対応の手配工程一覧（全製番・全組立工程）\n"
+            "工程をダブルクリックすると、該当する製番・組立工程の要対応部品へ移動します。"
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.table = QTableWidget()
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "発注先", "加工内容", "判定", "製番", "組立工程", "品番", "部品名", "工程順", "手配納期", "状態"
+        ])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.cellDoubleClicked.connect(self.choose_procurement)
+        layout.addWidget(self.table, 1)
+        self.count_label = QLabel()
+        layout.addWidget(self.count_label)
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(self.reject)
+        layout.addWidget(close_button)
+        self.refresh()
+
+    def refresh(self) -> None:
+        # ダッシュボードの集計と同じ判定基準を再使用する。
+        rows = []
+        for row in self.db.progress_tree_rows():
+            if row["procurement_id"] is None:
+                continue
+            detail = row["processing_details"] or "（加工内容未設定）"
+            if detail != self.processing_details:
+                continue
+            judgement, _color, is_problem = DashboardWidget.procurement_judgement(row)
+            if is_problem:
+                rows.append((row, judgement))
+        rows.sort(key=lambda pair: (
+            0 if pair[1] == "納期超過" else 1 if pair[1] == "目標超過" else 2,
+            pair[0]["procurement_due_date"] or "9999",
+            pair[0]["production_no"], pair[0]["assembly_process"]
+        ))
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        for index, (row, judgement) in enumerate(rows):
+            vals = [
+                row["vendor"] or "未設定", row["processing_details"] or "（加工内容未設定）",
+                judgement, row["production_no"], row["assembly_process"],
+                row["part_no"] or "", row["part_name"] or "",
+                row["process_order"], row["procurement_due_date"] or "",
+                row["procurement_status"] or ""
+            ]
+            for column, value in enumerate(vals):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.UserRole, int(row["procurement_id"]))
+                if column == 2:
+                    item.setForeground(QColor("red" if judgement in ("納期超過", "目標超過") else "darkorange"))
+                self.table.setItem(index, column, item)
+        self.table.setSortingEnabled(True)
+        self.count_label.setText(f"要対応工程 {len(rows)}件（工程単位で集計）")
+
+    def choose_procurement(self, row_index: int, _column: int) -> None:
+        item = self.table.item(row_index, 0)
+        if item is None or item.data(Qt.UserRole) is None:
+            return
+        self.selected_procurement_id = int(item.data(Qt.UserRole))
+        self.accept()
 
 
 class DataManagementDialog(QDialog):
@@ -3572,6 +3666,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.dashboard,"ダッシュボード"); self.tabs.addTab(self.progress_tree,"進捗ツリー"); self.tabs.addTab(self.orders,"生産計画"); self.tabs.addTab(self.bom,"部品表"); self.tabs.addTab(self.procurements,"手配"); self.tabs.addTab(self.masters,"マスタ")
         self.setCentralWidget(self.tabs)
         self.dashboard.procurement_requested.connect(self.open_procurement_in_tree)
+        self.dashboard.bottleneck_requested.connect(self.open_bottleneck_details)
         refresh_action=QAction("すべて更新",self); refresh_action.triggered.connect(self.refresh_all); self.menuBar().addAction(refresh_action)
         data_action=QAction("一括データ管理",self); data_action.triggered.connect(lambda: open_data_management(self, self.db, self.refresh_all, "orders")); self.menuBar().addAction(data_action)
         excel_action=QAction("Excel共有出力",self); excel_action.setShortcut("Ctrl+Shift+E"); excel_action.triggered.connect(lambda: export_excel_snapshot(self, self.db)); self.menuBar().addAction(excel_action)
@@ -3583,6 +3678,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"手配工程 ID:{procurement_id} を表示しました", 5000)
         else:
             QMessageBox.information(self, "対象が見つかりません", "指定された手配工程は現在のデータに存在しません。再読み込みしてください。")
+
+    def open_bottleneck_details(self, processing_details: str) -> None:
+        """集計から各工程の問題一覧を表示し、選択された工程へ遷移する。"""
+        dialog = BottleneckDetailsDialog(self.db, processing_details, self)
+        if dialog.exec() == QDialog.Accepted and dialog.selected_procurement_id is not None:
+            self.open_procurement_in_tree(dialog.selected_procurement_id)
 
     def refresh_all(self):
         self.orders.refresh(); self.bom.refresh(); self.procurements.refresh(); self.masters.refresh(); self.dashboard.refresh(); self.progress_tree.refresh()
