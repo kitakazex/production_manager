@@ -19,7 +19,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 import pandas as pd
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, Signal, QSettings
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -2001,6 +2001,8 @@ class TargetMappingDialog(QDialog):
 class DashboardWidget(QWidget):
     """Phase 5: 手配実績を基に進捗・遅延原因・今日の要対応を見える化する。"""
 
+    procurement_requested = Signal(int)  # 要対応行から進捗ツリーへ移動するための手配工程ID
+
     STATUS_PROGRESS = {
         "未手配": 0,
         "発注済": 25,
@@ -2050,7 +2052,15 @@ class DashboardWidget(QWidget):
             self.card_labels[key] = label
         root.addLayout(cards)
 
-        top_splitter = QSplitter()
+        # 上段左右／上中下の境界を独立してドラッグ可能にする。
+        # 分割位置はWindowsユーザーごとのQSettingsへ保存し、DBの仕様は変更しない。
+        self.dashboard_layout_settings = QSettings("YAMA AYATO", "production_manager")
+        self.dashboard_vertical_splitter = QSplitter(Qt.Vertical)
+        self.dashboard_vertical_splitter.setHandleWidth(8)
+        self.dashboard_vertical_splitter.setChildrenCollapsible(False)
+        self.dashboard_horizontal_splitter = QSplitter(Qt.Horizontal)
+        self.dashboard_horizontal_splitter.setHandleWidth(8)
+        self.dashboard_horizontal_splitter.setChildrenCollapsible(False)
         self.series_table = QTableWidget()
         self.series_table.setColumnCount(6)
         self.series_table.setHorizontalHeaderLabels(
@@ -2058,6 +2068,7 @@ class DashboardWidget(QWidget):
         )
         self.series_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.series_table.setAlternatingRowColors(True)
+        self.series_table.setMinimumHeight(95)
 
         self.bottleneck_table = QTableWidget()
         self.bottleneck_table.setColumnCount(5)
@@ -2066,10 +2077,13 @@ class DashboardWidget(QWidget):
         )
         self.bottleneck_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.bottleneck_table.setAlternatingRowColors(True)
+        self.bottleneck_table.setMinimumHeight(95)
 
-        top_splitter.addWidget(self.series_table)
-        top_splitter.addWidget(self.bottleneck_table)
-        root.addWidget(top_splitter)
+        self.dashboard_horizontal_splitter.addWidget(self.series_table)
+        self.dashboard_horizontal_splitter.addWidget(self.bottleneck_table)
+        self.dashboard_horizontal_splitter.setStretchFactor(0, 1)
+        self.dashboard_horizontal_splitter.setStretchFactor(1, 1)
+        self.dashboard_vertical_splitter.addWidget(self.dashboard_horizontal_splitter)
 
         self.order_table = QTableWidget()
         self.order_table.setColumnCount(11)
@@ -2079,7 +2093,8 @@ class DashboardWidget(QWidget):
         self.order_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.order_table.setAlternatingRowColors(True)
         self.order_table.setSortingEnabled(True)
-        root.addWidget(self.order_table)
+        self.order_table.setMinimumHeight(95)
+        self.dashboard_vertical_splitter.addWidget(self.order_table)
 
         self.action_table = QTableWidget()
         self.action_table.setColumnCount(9)
@@ -2089,8 +2104,29 @@ class DashboardWidget(QWidget):
         self.action_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.action_table.setAlternatingRowColors(True)
         self.action_table.setSortingEnabled(True)
-        root.addWidget(QLabel("今日の要対応（未手配・納期超過・計画目標超過）"))
-        root.addWidget(self.action_table)
+        self.action_table.setMinimumHeight(95)
+        self.action_table.cellDoubleClicked.connect(self.open_action_procurement)
+        action_panel = QWidget()
+        action_layout = QVBoxLayout(action_panel)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.addWidget(QLabel("今日の要対応（未手配・納期超過・計画目標超過） ※ダブルクリックで進捗ツリーへ"))
+        action_layout.addWidget(self.action_table, 1)
+        self.dashboard_vertical_splitter.addWidget(action_panel)
+
+        for section in range(3):
+            self.dashboard_vertical_splitter.setStretchFactor(section, 1)
+        # 最低限の可読領域を確保し、境界のドラッグで表が消えないようにする。
+        self.dashboard_horizontal_splitter.setSizes([1, 1])
+        self.dashboard_vertical_splitter.setSizes([2, 3, 3])
+        horizontal_state = self.dashboard_layout_settings.value("dashboard/horizontal_splitter")
+        vertical_state = self.dashboard_layout_settings.value("dashboard/vertical_splitter")
+        if horizontal_state is not None:
+            self.dashboard_horizontal_splitter.restoreState(horizontal_state)
+        if vertical_state is not None:
+            self.dashboard_vertical_splitter.restoreState(vertical_state)
+        self.dashboard_horizontal_splitter.splitterMoved.connect(self.save_dashboard_splitters)
+        self.dashboard_vertical_splitter.splitterMoved.connect(self.save_dashboard_splitters)
+        root.addWidget(self.dashboard_vertical_splitter, 1)
 
         self.summary = QLabel()
         self.summary.setStyleSheet("font-weight: bold; padding: 4px;")
@@ -2100,6 +2136,24 @@ class DashboardWidget(QWidget):
         self.state_filter.currentTextChanged.connect(self.refresh)
         self.search.textChanged.connect(self.refresh)
         refresh_btn.clicked.connect(self.refresh)
+
+    def save_dashboard_splitters(self, _position: int, _index: int) -> None:
+        """操作した分割位置を保存し、次回起動時にも復元する。"""
+        self.dashboard_layout_settings.setValue(
+            "dashboard/horizontal_splitter", self.dashboard_horizontal_splitter.saveState()
+        )
+        self.dashboard_layout_settings.setValue(
+            "dashboard/vertical_splitter", self.dashboard_vertical_splitter.saveState()
+        )
+
+    def open_action_procurement(self, row_index: int, _column: int) -> None:
+        """表示行の順序が変わっても、内部IDで移動先を確定する。"""
+        item = self.action_table.item(row_index, 0)
+        if item is None:
+            return
+        procurement_id = item.data(Qt.UserRole)
+        if procurement_id is not None:
+            self.procurement_requested.emit(int(procurement_id))
 
     @classmethod
     def procurement_progress(cls, status):
@@ -2301,6 +2355,8 @@ class DashboardWidget(QWidget):
                 item = QTableWidgetItem(str(value))
                 if c in (0, 8):
                     item.setForeground(QColor("red" if priority == 1 else "darkorange"))
+                if c == 0:
+                    item.setData(Qt.UserRole, int(row["procurement_id"]))
                 self.action_table.setItem(i, c, item)
         self.action_table.setSortingEnabled(True)
 
@@ -3016,6 +3072,7 @@ class ProgressTreeWidget(QWidget):
         super().__init__(); self.db=db; self.on_change=on_change
         root=QVBoxLayout(self)
         bar=QHBoxLayout()
+        self._drilldown_order_id = None  # 製番だけでなく組立工程まで区別する生産計画ID
         self.production_filter=QComboBox(); self.production_filter.addItem("すべて")
         self.mode_filter=QComboBox(); self.mode_filter.addItems(["すべて","要対応のみ","未完了のみ"])
         self.search=QLineEdit(); self.search.setPlaceholderText("製番・部品・加工内容・発注先を検索")
@@ -3023,6 +3080,13 @@ class ProgressTreeWidget(QWidget):
         bar.addWidget(QLabel("製番")); bar.addWidget(self.production_filter); bar.addWidget(QLabel("表示")); bar.addWidget(self.mode_filter)
         bar.addWidget(QLabel("検索")); bar.addWidget(self.search,1); bar.addWidget(expand_btn); bar.addWidget(collapse_btn); bar.addWidget(refresh_btn)
         root.addLayout(bar)
+        scope_bar=QHBoxLayout()
+        self.drilldown_label=QLabel("")
+        self.drilldown_clear_btn=QPushButton("要対応の絞り込みを解除")
+        self.drilldown_label.setStyleSheet("font-weight:bold; color:#b45309; padding:4px;")
+        self.drilldown_label.hide(); self.drilldown_clear_btn.hide()
+        scope_bar.addWidget(self.drilldown_label,1); scope_bar.addWidget(self.drilldown_clear_btn)
+        root.addLayout(scope_bar)
         guide=QLabel("①生産計画 → ②部品 → ③停止工程 → ④発注先・状態 の順にクリックすると、右側に原因が表示されます。")
         guide.setWordWrap(True); guide.setStyleSheet("padding:6px; font-weight:bold;"); root.addWidget(guide)
 
@@ -3052,7 +3116,8 @@ class ProgressTreeWidget(QWidget):
         root.addWidget(splitter,1)
         self.summary=QLabel(); self.summary.setStyleSheet("font-weight:bold; padding:6px;"); root.addWidget(self.summary)
 
-        self.production_filter.currentTextChanged.connect(self.refresh); self.mode_filter.currentTextChanged.connect(self.refresh); self.search.textChanged.connect(self.apply_search)
+        self.production_filter.currentTextChanged.connect(self.on_manual_filter_change); self.mode_filter.currentTextChanged.connect(self.on_manual_filter_change); self.search.textChanged.connect(self.apply_search)
+        self.drilldown_clear_btn.clicked.connect(self.clear_drilldown)
         expand_btn.clicked.connect(self.tree.expandAll); collapse_btn.clicked.connect(self.tree.collapseAll); refresh_btn.clicked.connect(self.refresh)
         self.tree.itemDoubleClicked.connect(self.edit_procurement); self.tree.itemSelectionChanged.connect(self.update_detail)
 
@@ -3076,13 +3141,42 @@ class ProgressTreeWidget(QWidget):
         bar=QProgressBar(); bar.setRange(0,100); bar.setValue(value); bar.setFormat(f"{value}%"); bar.setMaximumHeight(22)
         return bar
 
+    def on_manual_filter_change(self, _value=None):
+        """手動フィルターを優先し、ダッシュボードからの一時絞り込みを解除する。"""
+        self._drilldown_order_id = None
+        self.drilldown_label.hide(); self.drilldown_clear_btn.hide()
+        self.refresh()
+
+    def clear_drilldown(self):
+        """対象工程を絞った一時表示から、元の全体一覧に戻る。"""
+        self._drilldown_order_id = None
+        self.production_filter.blockSignals(True)
+        self.mode_filter.blockSignals(True)
+        try:
+            self.production_filter.setCurrentText("すべて")
+            self.mode_filter.setCurrentText("すべて")
+        finally:
+            self.production_filter.blockSignals(False)
+            self.mode_filter.blockSignals(False)
+        self.search.clear()
+        self.drilldown_label.hide(); self.drilldown_clear_btn.hide()
+        self.refresh()
+
     def refresh(self):
         rows=self.db.progress_tree_rows(); values=sorted({r["production_no"] for r in rows}); current=self.production_filter.currentText()
         self.production_filter.blockSignals(True); self.production_filter.clear(); self.production_filter.addItem("すべて"); self.production_filter.addItems(values); self.production_filter.setCurrentText(current if current in values else "すべて"); self.production_filter.blockSignals(False)
         selected=self.production_filter.currentText()
         if selected!="すべて": rows=[r for r in rows if r["production_no"]==selected]
+        if self._drilldown_order_id is not None:
+            rows=[r for r in rows if r["order_id"] == self._drilldown_order_id]
         mode=self.mode_filter.currentText(); self.tree.clear(); orders={}; parts={}; total_proc=completed_proc=problem_proc=0
         for row in rows:
+            # 一時絞り込みでは問題のある工程だけ残し、正常部品・正常工程を出さない。
+            if self._drilldown_order_id is not None:
+                if row["procurement_id"] is None or self.judgement(row)[0] not in (
+                    "納期超過", "目標超過", "未手配", "手配なし", "納期未設定"
+                ):
+                    continue
             oid=row["order_id"]
             if oid not in orders:
                 item=QTreeWidgetItem([f'▾ {row["production_no"]}  {row["assembly_process"]}',f'{row["series"]} / {row["order_state"]}',"",row["parts_completion_date"] or row["order_due_date"] or "","",""])
@@ -3119,6 +3213,68 @@ class ProgressTreeWidget(QWidget):
             self.tree.setItemWidget(item,2,self.make_progress_bar(progress)); item.setText(5,f'要対応 {len(info["problems"])}件' if info["problems"] else ('完了' if progress==100 else '進行中')); item.setForeground(5,QColor('red' if info["problems"] else 'green' if progress==100 else 'blue'))
         self.summary.setText(f'表示: 生産計画 {self.tree.topLevelItemCount()}件 / 手配工程 {total_proc}件 / 完了 {completed_proc}件 / 要対応 {problem_proc}件')
         self.tree.expandToDepth(1); self.apply_search(); self.update_detail()
+
+    def focus_procurement(self, procurement_id: int) -> bool:
+        """対象の製番×組立工程の要対応工程だけ表示し、元の手配IDを選択する。"""
+        rows = self.db.progress_tree_rows()
+        target = next((r for r in rows if r["procurement_id"] == procurement_id), None)
+        if target is None:
+            return False
+        # order_idを使うことで同じ製番の別組立工程が混ざらない。
+        self._drilldown_order_id = target["order_id"]
+        self.production_filter.blockSignals(True)
+        self.mode_filter.blockSignals(True)
+        self.search.blockSignals(True)
+        try:
+            self.production_filter.setCurrentText(target["production_no"])
+            self.mode_filter.setCurrentText("要対応のみ")
+            self.search.clear()
+        finally:
+            self.production_filter.blockSignals(False)
+            self.mode_filter.blockSignals(False)
+            self.search.blockSignals(False)
+        self.drilldown_label.setText(
+            f'ダッシュボードからの絞り込み：製番 {target["production_no"]} / '
+            f'組立工程 {target["assembly_process"]} / 要対応工程のみ'
+        )
+        self.drilldown_label.show(); self.drilldown_clear_btn.show()
+        self.refresh()
+        for i in range(self.tree.topLevelItemCount()):
+            order_item = self.tree.topLevelItem(i)
+            for j in range(order_item.childCount()):
+                part_item = order_item.child(j)
+                for k in range(part_item.childCount()):
+                    item = part_item.child(k)
+                    if (item.data(0, Qt.UserRole) == "procurement"
+                            and item.data(0, Qt.UserRole + 1) == procurement_id):
+                        self.tree.expandItem(order_item)
+                        self.tree.expandItem(part_item)
+                        self.tree.setCurrentItem(item)
+                        self.tree.scrollToItem(item)
+                        self.update_detail()
+                        return True
+        # 表示中に判定が変わった場合も対象工程への移動は失敗扱いにせず、
+        # 同じ製番・組立工程内で通常表示して対象を探す。
+        self.mode_filter.blockSignals(True)
+        try:
+            self.mode_filter.setCurrentText("すべて")
+        finally:
+            self.mode_filter.blockSignals(False)
+        self._drilldown_order_id = None
+        self.drilldown_label.hide(); self.drilldown_clear_btn.hide()
+        self.refresh()
+        for i in range(self.tree.topLevelItemCount()):
+            order_item = self.tree.topLevelItem(i)
+            for j in range(order_item.childCount()):
+                part_item = order_item.child(j)
+                for k in range(part_item.childCount()):
+                    item = part_item.child(k)
+                    if item.data(0, Qt.UserRole + 1) == procurement_id and item.data(0, Qt.UserRole) == "procurement":
+                        self.tree.expandItem(order_item); self.tree.expandItem(part_item)
+                        self.tree.setCurrentItem(item); self.tree.scrollToItem(item)
+                        self.update_detail()
+                        return True
+        return False
 
     def apply_search(self):
         term=normalize_header(self.search.text())
@@ -3415,10 +3571,19 @@ class MainWindow(QMainWindow):
         self.tabs=QTabWidget(); self.dashboard=DashboardWidget(self.db); self.progress_tree=ProgressTreeWidget(self.db,self.refresh_all); self.orders=OrdersWidget(self.db,self.refresh_all); self.bom=BomWidget(self.db,self.refresh_all); self.procurements=ProcurementsWidget(self.db,self.refresh_all); self.masters=MastersWidget(self.db,self.refresh_all)
         self.tabs.addTab(self.dashboard,"ダッシュボード"); self.tabs.addTab(self.progress_tree,"進捗ツリー"); self.tabs.addTab(self.orders,"生産計画"); self.tabs.addTab(self.bom,"部品表"); self.tabs.addTab(self.procurements,"手配"); self.tabs.addTab(self.masters,"マスタ")
         self.setCentralWidget(self.tabs)
+        self.dashboard.procurement_requested.connect(self.open_procurement_in_tree)
         refresh_action=QAction("すべて更新",self); refresh_action.triggered.connect(self.refresh_all); self.menuBar().addAction(refresh_action)
         data_action=QAction("一括データ管理",self); data_action.triggered.connect(lambda: open_data_management(self, self.db, self.refresh_all, "orders")); self.menuBar().addAction(data_action)
         excel_action=QAction("Excel共有出力",self); excel_action.setShortcut("Ctrl+Shift+E"); excel_action.triggered.connect(lambda: export_excel_snapshot(self, self.db)); self.menuBar().addAction(excel_action)
         self.setStatusBar(QStatusBar()); self.refresh_all()
+    def open_procurement_in_tree(self, procurement_id: int) -> None:
+        """ダッシュボードの要対応行から該当手配工程を開く。"""
+        if self.progress_tree.focus_procurement(procurement_id):
+            self.tabs.setCurrentWidget(self.progress_tree)
+            self.statusBar().showMessage(f"手配工程 ID:{procurement_id} を表示しました", 5000)
+        else:
+            QMessageBox.information(self, "対象が見つかりません", "指定された手配工程は現在のデータに存在しません。再読み込みしてください。")
+
     def refresh_all(self):
         self.orders.refresh(); self.bom.refresh(); self.procurements.refresh(); self.masters.refresh(); self.dashboard.refresh(); self.progress_tree.refresh()
         self.statusBar().showMessage(f"更新: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}  DB: {DB_PATH}",5000)
